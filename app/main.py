@@ -15,6 +15,13 @@ from .alerts import (
     get_rule,
     update_rule,
 )
+from .calibrations import (
+    CalibrationConflict,
+    CalibrationError,
+    apply_calibration,
+    create_calibration,
+    resolve_calibration,
+)
 from . import exports
 from .exports import ExportError, InvalidCursor
 from .logic import IdempotencyConflict, ingest_package
@@ -24,6 +31,9 @@ from .schemas import (
     AlertEventOut,
     CurrentAlertOut,
     CurrentAlertsResponse,
+    CalibrationCreate,
+    CalibrationOut,
+    CalibrationResolveResponse,
     CommittedResponse,
     DeviceState,
     DuplicatesResponse,
@@ -416,6 +426,67 @@ def get_device_alert_events(
         limit=limit,
         offset=offset,
         events=[AlertEventOut(**dict(r)) for r in rows],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 设备指标校准
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/calibrations", response_model=CalibrationOut, status_code=201)
+def post_calibration(cal_in: CalibrationCreate):
+    """创建线性校准配置；同 (设备, 指标) 有效时间段重叠时返回 409。"""
+    with db.ingest_lock, db.get_conn() as conn:
+        try:
+            cal_id = create_calibration(
+                conn,
+                cal_in.device_id,
+                cal_in.metric,
+                cal_in.valid_from,
+                cal_in.valid_to,
+                cal_in.offset,
+                cal_in.scale,
+            )
+        except CalibrationConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except CalibrationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        row = conn.execute(
+            "SELECT * FROM calibrations WHERE id = ?", (cal_id,)
+        ).fetchone()
+        return CalibrationOut(**dict(row))
+
+
+@app.get(
+    "/api/v1/devices/{device_id}/calibrations/resolve",
+    response_model=CalibrationResolveResponse,
+)
+def resolve_device_calibration(
+    device_id: str,
+    metric: str = Query(min_length=1, description="指标名，如 temperature"),
+    at: datetime = Query(description="生效时刻，ISO 8601；不带时区按 UTC"),
+    value: float = Query(description="原始测量值"),
+):
+    """按 at 解析 (设备, 指标) 唯一生效的校准配置并计算校准值。
+
+    校准值 = value * scale + offset；无生效配置时 calibration 与
+    calibrated_value 均为 null。只读操作，不改写已存储的原始测量。
+    """
+    with db.get_conn() as conn:
+        row = resolve_calibration(conn, device_id, metric, at)
+    calibration = CalibrationOut(**dict(row)) if row is not None else None
+    calibrated = (
+        apply_calibration(value, row["scale"], row["offset"])
+        if row is not None
+        else None
+    )
+    return CalibrationResolveResponse(
+        device_id=device_id,
+        metric=metric,
+        at=at,
+        value=value,
+        calibrated_value=calibrated,
+        calibration=calibration,
     )
 
 

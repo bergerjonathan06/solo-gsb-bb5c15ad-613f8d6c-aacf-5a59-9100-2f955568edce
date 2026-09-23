@@ -129,6 +129,22 @@ CREATE TABLE IF NOT EXISTS export_items (
     line       BLOB NOT NULL,                -- 规范化 NDJSON 行（含行尾换行符）
     PRIMARY KEY (export_id, item_index)
 );
+
+-- 设备指标线性校准配置：同一 (设备, 指标) 的有效时间段互不重叠（创建时事务内校验）。
+-- 时间以固定微秒宽度的 UTC ISO 字符串存储，字典序即时间序，区间比较可直接在 SQL 完成。
+CREATE TABLE IF NOT EXISTS calibrations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   TEXT NOT NULL,
+    metric      TEXT NOT NULL,
+    valid_from  TEXT NOT NULL,              -- 生效起点（含）
+    valid_to    TEXT,                       -- 生效终点（不含）；null 表示无限期
+    offset      REAL NOT NULL DEFAULT 0,    -- 线性偏移：校准值 = 原始值 * scale + offset
+    scale       REAL NOT NULL DEFAULT 1,    -- 线性增益
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_calibrations_device_metric
+    ON calibrations (device_id, metric, valid_from);
 """
 
 

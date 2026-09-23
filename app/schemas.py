@@ -217,6 +217,55 @@ class CurrentAlertsResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 设备指标校准
+# ---------------------------------------------------------------------------
+
+class CalibrationCreate(BaseModel):
+    """创建一条线性校准配置：校准值 = 原始值 * scale + offset。"""
+
+    device_id: str = Field(min_length=1)
+    metric: str = Field(min_length=1, description="指标名，如 temperature")
+    valid_from: datetime = Field(description="生效起点（含），ISO 8601；不带时区按 UTC")
+    valid_to: Optional[datetime] = Field(
+        default=None, description="生效终点（不含），ISO 8601；缺省表示无限期"
+    )
+    offset: float = Field(default=0.0, description="线性偏移")
+    scale: float = Field(default=1.0, description="线性增益")
+
+    @model_validator(mode="after")
+    def _check_range(self):
+        if self.valid_to is not None and self.valid_from >= self.valid_to:
+            raise ValueError("valid_from 必须早于 valid_to")
+        return self
+
+
+class CalibrationOut(BaseModel):
+    id: int
+    device_id: str
+    metric: str
+    valid_from: datetime
+    valid_to: Optional[datetime]
+    offset: float
+    scale: float
+    created_at: str
+
+
+class CalibrationResolveResponse(BaseModel):
+    """按时刻解析生效校准配置并计算校准值；无生效配置时 calibration 为 null。"""
+
+    device_id: str
+    metric: str
+    at: datetime
+    value: float = Field(description="原始测量值")
+    calibrated_value: Optional[float] = Field(
+        description="校准值 = value * scale + offset；无生效配置时为 null"
+    )
+    calibration: Optional[CalibrationOut] = Field(
+        description="at 时刻唯一生效的校准配置；无配置为 null"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 只读归档导出
 # ---------------------------------------------------------------------------
 

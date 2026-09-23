@@ -7,6 +7,7 @@
 - **可观测接口**：查询每台设备的缺口、已提交序号与重复包记录；
 - **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本；
 - **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite。
+- **设备指标校准**：按设备 + 指标维护线性校准配置（`校准值 = 原始值 × scale + offset`），有效时间段互不重叠（事务内校验），按时刻解析唯一生效配置并计算校准值，不改写已存原始测量。
 - **只读归档导出**：按设备 + seq 范围创建一次性导出任务，返回 NDJSON 分页游标与 manifest（包数、首尾序号、规范化内容 SHA-256），快照不可变、续传字节稳定，并提供摘要校验接口；导出不触碰提交、缓冲、重复与告警数据。
 
 ## 快速开始
@@ -18,7 +19,7 @@ docker compose up --build
 ```
 
 这一条命令完成全部初始化：构建镜像 → 容器内安装依赖（`docker-entrypoint.sh`）→
-应用启动钩子自动创建 SQLite 数据库与全部表结构（含告警规则、规则状态、告警事件表）→ 启动服务。
+应用启动钩子自动创建 SQLite 数据库与全部表结构（含告警规则、规则状态、告警事件、校准配置表）→ 启动服务。
 数据库文件持久化在命名卷 `lab-data`（容器内 `/data/lab.db`），重启不丢规则与事件。
 
 服务地址：http://localhost:8000 ，交互式文档：http://localhost:8000/docs
@@ -88,6 +89,8 @@ pytest tests/
 | DELETE | `/api/v1/rules/{rule_id}` | 删除规则（历史事件保留） |
 | GET | `/api/v1/alerts` | 当前仍处于告警中的规则（可按 `device_id`/`metric` 过滤） |
 | GET | `/api/v1/devices/{id}/alerts/events` | 按设备、可选指标分页查询触发/恢复事件 |
+| POST | `/api/v1/calibrations` | 创建设备指标线性校准配置（有效时间段不重叠，事务内校验） |
+| GET | `/api/v1/devices/{id}/calibrations/resolve` | 按 `metric`/`at`/`value` 解析唯一生效配置并计算校准值（无配置返回 null） |
 | POST | `/api/v1/exports` | 按设备 + seq 范围创建只读导出任务（manifest + 首页游标） |
 | GET | `/api/v1/exports/{id}/manifest` | 查询导出 manifest |
 | GET | `/api/v1/exports/{id}/pages?cursor=` | NDJSON 分页续传（响应头返回下一个游标） |
@@ -208,6 +211,63 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/alerts/events?metric=temperature
 #        "event_type":"recovered","value":27.0,"event_time":"2026-09-22T08:00:08Z","created_at":"..."}]}
 ```
 
+## 设备指标校准（Calibrations）
+
+按 **设备 + 指标** 维护线性校准配置：`校准值 = 原始值 × scale + offset`。
+每条配置声明一个半开有效区间 `[valid_from, valid_to)`（`valid_to` 缺省表示无限期），
+同一 (设备, 指标) 的有效区间**不得重叠**——创建时在同一事务内完成重叠校验与写入，
+重叠返回 `409`，因此任意时刻至多一条配置生效。
+
+校准只在查询时计算，**不改写已存储的原始测量**：已提交数据、窗口聚合与归档导出
+始终保持原始值。
+
+### 创建配置
+
+`POST /api/v1/calibrations`
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `device_id` / `metric` | 是 | 设备号与指标名 |
+| `valid_from` | 是 | 生效起点（含），ISO 8601；不带时区按 UTC |
+| `valid_to` | 否 | 生效终点（不含），ISO 8601；缺省表示无限期 |
+| `offset` | 否 | 线性偏移，默认 `0` |
+| `scale` | 否 | 线性增益，默认 `1` |
+
+```bash
+curl -X POST localhost:8000/api/v1/calibrations -H 'Content-Type: application/json' -d '{
+  "device_id": "ph-meter-01", "metric": "temperature",
+  "valid_from": "2026-09-01T00:00:00Z", "valid_to": "2026-10-01T00:00:00Z",
+  "offset": 0.5, "scale": 1.02
+}'
+# => 201 {"id":1,"device_id":"ph-meter-01","metric":"temperature",
+#        "valid_from":"2026-09-01T00:00:00Z","valid_to":"2026-10-01T00:00:00Z",
+#        "offset":0.5,"scale":1.02,"created_at":"..."}
+```
+
+错误：`valid_from >= valid_to` → `422`；与同 (设备, 指标) 已有配置的有效区间重叠
+→ `409`（相接的半开区间，如一段终点等于另一段起点，不算重叠）。
+
+### 按时刻解析并计算校准值
+
+`GET /api/v1/devices/{device_id}/calibrations/resolve?metric=&at=&value=`
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `metric` | 是 | 指标名 |
+| `at` | 是 | 生效时刻，ISO 8601（不带时区按 UTC）；区间边界为 `[valid_from, valid_to)` |
+| `value` | 是 | 原始测量值 |
+
+```bash
+curl 'localhost:8000/api/v1/devices/ph-meter-01/calibrations/resolve?metric=temperature&at=2026-09-15T08:00:00Z&value=21.4'
+# => {"device_id":"ph-meter-01","metric":"temperature","at":"2026-09-15T08:00:00Z",
+#     "value":21.4,"calibrated_value":22.328,
+#     "calibration":{"id":1,"device_id":"ph-meter-01","metric":"temperature",
+#                    "valid_from":"2026-09-01T00:00:00Z","valid_to":"2026-10-01T00:00:00Z",
+#                    "offset":0.5,"scale":1.02,"created_at":"..."}}
+```
+
+无生效配置时 HTTP 仍为 `200`，`calibration` 与 `calibrated_value` 均为 `null`。
+
 ## 只读归档导出（Exports）
 
 对某台设备按 **seq 范围**创建一次只读导出任务。任务在创建时刻把范围内
@@ -325,19 +385,21 @@ curl localhost:8000/api/v1/devices/ph-meter-01/duplicates   # 重复包记录
 
 ```
 app/
-  main.py     # FastAPI 路由
-  logic.py    # 摄入核心：幂等判定、缓冲、排水提交（提交时驱动告警评估）
-  alerts.py   # 阈值告警：规则 CRUD、带连续计数的迟滞状态机、按提交顺序评估
-  rollup.py   # 窗口聚合：半开窗口分桶、水位迟到判定
-  exports.py  # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验
-  db.py       # SQLite 连接与建表（启动时自动执行）
-  schemas.py  # Pydantic 模型
+  main.py         # FastAPI 路由
+  logic.py        # 摄入核心：幂等判定、缓冲、排水提交（提交时驱动告警评估）
+  alerts.py       # 阈值告警：规则 CRUD、带连续计数的迟滞状态机、按提交顺序评估
+  calibrations.py # 设备指标校准：有效区间不重叠校验、按时刻解析与线性校准计算
+  rollup.py       # 窗口聚合：半开窗口分桶、水位迟到判定
+  exports.py      # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验
+  db.py           # SQLite 连接与建表（启动时自动执行）
+  schemas.py      # Pydantic 模型
 tests/
-  conftest.py     # 测试数据库隔离（临时文件）
-  test_api.py     # 摄入 / 查询接口测试
-  test_rollup.py  # 窗口聚合测试
-  test_alerts.py  # 阈值告警测试
-  test_exports.py # 归档导出 / 游标 / 摘要校验测试
+  conftest.py           # 测试数据库隔离（临时文件）
+  test_api.py           # 摄入 / 查询接口测试
+  test_rollup.py        # 窗口聚合测试
+  test_alerts.py        # 阈值告警测试
+  test_calibrations.py  # 校准配置 / 解析 / 原始数据不变测试
+  test_exports.py       # 归档导出 / 游标 / 摘要校验测试
 Dockerfile / docker-entrypoint.sh / docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```
