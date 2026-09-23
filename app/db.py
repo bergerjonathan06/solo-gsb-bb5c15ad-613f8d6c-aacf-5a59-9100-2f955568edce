@@ -129,6 +129,26 @@ CREATE TABLE IF NOT EXISTS export_items (
     line       BLOB NOT NULL,                -- 规范化 NDJSON 行（含行尾换行符）
     PRIMARY KEY (export_id, item_index)
 );
+
+-- 设备指标的线性校准配置：calibrated = raw * scale + offset；
+-- 同一 (device_id, metric) 的有效期为半开区间 [valid_from, valid_to)，
+-- valid_to 为 null 表示长期有效（开放终点），区间之间不得重叠（端点相接允许）。
+-- 时间统一以 UTC、固定 6 位小数秒 + Z 存储，保证可直接字典序比较。
+CREATE TABLE IF NOT EXISTS calibrations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   TEXT NOT NULL,
+    metric      TEXT NOT NULL,
+    valid_from  TEXT NOT NULL,
+    valid_to    TEXT,
+    offset REAL NOT NULL DEFAULT 0.0,
+    scale  REAL NOT NULL DEFAULT 1.0,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK (scale <> 0),
+    CHECK (valid_to IS NULL OR valid_from < valid_to)
+);
+
+CREATE INDEX IF NOT EXISTS idx_calibrations_resolve
+    ON calibrations (device_id, metric, valid_from, valid_to);
 """
 
 

@@ -280,3 +280,56 @@ class ExportVerifyResponse(BaseModel):
     expected_sha256: str
     received_sha256: str
     manifest: ExportManifest
+
+
+# ---------------------------------------------------------------------------
+# 设备指标校准配置
+# ---------------------------------------------------------------------------
+
+class CalibrationCreate(BaseModel):
+    """为 设备+指标 创建一段有效期内的线性校准配置。"""
+
+    device_id: str = Field(min_length=1)
+    metric: str = Field(min_length=1, description="指标名，如 temperature")
+    valid_from: datetime = Field(description="生效起点（含），ISO 8601；不带时区按 UTC 处理")
+    valid_to: Optional[datetime] = Field(
+        default=None, description="生效终点（不含）；缺省为 null 表示长期有效"
+    )
+    offset: float = Field(default=0.0, description="线性偏移量 b：calibrated = raw * scale + offset")
+    scale: float = Field(
+        default=1.0, description="线性比例 a：calibrated = raw * scale + offset，不可为 0"
+    )
+
+    @model_validator(mode="after")
+    def _check_range(self):
+        if self.scale == 0:
+            raise ValueError("scale 不能为 0")
+        if self.valid_to is not None and self.valid_from >= self.valid_to:
+            raise ValueError("valid_from 必须早于 valid_to")
+        return self
+
+
+class CalibrationOut(BaseModel):
+    id: int
+    device_id: str
+    metric: str
+    valid_from: datetime
+    valid_to: Optional[datetime]
+    offset: float
+    scale: float
+    created_at: datetime
+
+
+class CalibrationResolveResponse(BaseModel):
+    """at 时刻的解析结果；无生效配置时 calibration / calibrated_value 均为 null。"""
+
+    device_id: str
+    metric: str
+    at: datetime
+    value: float = Field(description="输入的原始测量值（只读，不做任何改写）")
+    calibrated_value: Optional[float] = Field(
+        default=None, description="校准值 value*scale+offset；无生效配置时为 null"
+    )
+    calibration: Optional[CalibrationOut] = Field(
+        default=None, description="唯一生效的校准配置；无生效配置时为 null"
+    )

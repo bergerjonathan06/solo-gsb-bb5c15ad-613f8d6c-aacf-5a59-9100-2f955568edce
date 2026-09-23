@@ -11,6 +11,8 @@ COPY docker-entrypoint.sh .
 RUN chmod +x docker-entrypoint.sh
 
 ENV DB_PATH=/data/lab.db
+# 服务监听端口；docker-entrypoint.sh 读取该变量启动 uvicorn，与 EXPOSE 保持一致
+ENV PORT=8000
 EXPOSE 8000
 
 ENTRYPOINT ["./docker-entrypoint.sh"]

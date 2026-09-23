@@ -15,6 +15,13 @@ from .alerts import (
     get_rule,
     update_rule,
 )
+from .calibrations import (
+    CalibrationConflict,
+    CalibrationError,
+    apply as apply_calibration,
+)
+from .calibrations import create_calibration
+from .calibrations import resolve_calibration as resolve_calibration_row
 from . import exports
 from .exports import ExportError, InvalidCursor
 from .logic import IdempotencyConflict, ingest_package
@@ -22,6 +29,9 @@ from .rollup import RollupError, compute_rollup
 from .schemas import (
     AlertEventsResponse,
     AlertEventOut,
+    CalibrationCreate,
+    CalibrationOut,
+    CalibrationResolveResponse,
     CurrentAlertOut,
     CurrentAlertsResponse,
     CommittedResponse,
@@ -515,4 +525,78 @@ def post_export_verify(export_id: str, verify_in: ExportVerifyRequest):
         expected_sha256=task.content_sha256,
         received_sha256=verify_in.content_sha256.strip().lower(),
         manifest=manifest,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 设备指标校准配置（线性 offset/scale，只在解析时计算，不改写原始测量）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/calibrations", response_model=CalibrationOut, status_code=201)
+def post_calibration(body: CalibrationCreate):
+    """创建校准配置。同设备同指标的有效期不得重叠，校验与写入在同一事务内完成。"""
+    with db.ingest_lock, db.get_conn() as conn:
+        try:
+            cal = create_calibration(
+                conn,
+                body.device_id,
+                body.metric,
+                body.valid_from,
+                body.valid_to,
+                body.offset,
+                body.scale,
+            )
+        except CalibrationConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except CalibrationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return CalibrationOut(
+            id=cal.id,
+            device_id=cal.device_id,
+            metric=cal.metric,
+            valid_from=cal.valid_from,
+            valid_to=cal.valid_to,
+            offset=cal.offset,
+            scale=cal.scale,
+            created_at=cal.created_at,
+        )
+
+
+@app.get(
+    "/api/v1/devices/{device_id}/calibrations/resolve",
+    response_model=CalibrationResolveResponse,
+)
+def resolve_calibration(
+    device_id: str,
+    metric: str = Query(min_length=1, description="指标名，如 temperature"),
+    at: datetime = Query(description="解析时刻，ISO 8601；不带时区按 UTC 处理"),
+    value: float = Query(description="待校准的原始测量值（只读，不改写已存数据）"),
+):
+    """按 at 返回唯一生效的校准配置并计算校准值；无生效配置时两者均为 null。"""
+    with db.get_conn() as conn:
+        try:
+            cal = resolve_calibration_row(conn, device_id, metric, at)
+        except CalibrationError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    calibrated = apply_calibration(cal, value) if cal is not None else None
+    return CalibrationResolveResponse(
+        device_id=device_id,
+        metric=metric,
+        at=at,
+        value=value,
+        calibrated_value=calibrated,
+        calibration=(
+            CalibrationOut(
+                id=cal.id,
+                device_id=cal.device_id,
+                metric=cal.metric,
+                valid_from=cal.valid_from,
+                valid_to=cal.valid_to,
+                offset=cal.offset,
+                scale=cal.scale,
+                created_at=cal.created_at,
+            )
+            if cal is not None
+            else None
+        ),
     )

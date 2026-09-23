@@ -7,6 +7,7 @@
 - **可观测接口**：查询每台设备的缺口、已提交序号与重复包记录；
 - **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本；
 - **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite。
+- **设备指标校准**：按 设备 + 指标 配置带有效期的线性校准（`calibrated = raw * scale + offset`），同设备同指标的有效期互不重叠（事务内校验），按时刻解析唯一生效配置并实时计算校准值；**校准只在读取时计算，绝不改写已存原始测量**。
 - **只读归档导出**：按设备 + seq 范围创建一次性导出任务，返回 NDJSON 分页游标与 manifest（包数、首尾序号、规范化内容 SHA-256），快照不可变、续传字节稳定，并提供摘要校验接口；导出不触碰提交、缓冲、重复与告警数据。
 
 ## 快速开始
@@ -18,16 +19,23 @@ docker compose up --build
 ```
 
 这一条命令完成全部初始化：构建镜像 → 容器内安装依赖（`docker-entrypoint.sh`）→
-应用启动钩子自动创建 SQLite 数据库与全部表结构（含告警规则、规则状态、告警事件表）→ 启动服务。
-数据库文件持久化在命名卷 `lab-data`（容器内 `/data/lab.db`），重启不丢规则与事件。
+应用启动钩子自动创建 SQLite 数据库与全部表结构（含告警规则、规则状态、告警事件与设备校准表）→ 启动服务。
+数据库文件持久化在命名卷 `lab-data`（容器内 `/data/lab.db`），重启不丢规则、事件与校准配置。
 
-服务地址：http://localhost:8000 ，交互式文档：http://localhost:8000/docs
+服务监听容器内 **8000** 端口并映射到宿主机同名端口（`docker-compose.yml` 的 `ports: ["8000:8000"]`）：
+
+- 服务地址：http://localhost:8000
+- 健康检查：http://localhost:8000/health
+- 交互式文档（Swagger UI）：http://localhost:8000/docs
+
+宿主机端口如需更换，把映射改为 `"18000:8000"` 即可；容器内监听端口可由环境变量
+`PORT`（默认 `8000`，见 `docker-entrypoint.sh`）控制，此时映射右侧同步改为该端口。
 
 ### 本地开发（单命令初始化 + 起服务）
 
 ```bash
 pip install -r requirements-dev.txt   # 初始化依赖（含运行时与 pytest）
-uvicorn app.main:app --reload         # 数据库默认创建在 ./lab.db，可用 DB_PATH 覆盖
+uvicorn app.main:app --reload         # 默认监听 0.0.0.0:8000；数据库默认 ./lab.db，可用 DB_PATH 覆盖
 ```
 
 另起终端运行测试：
@@ -92,6 +100,8 @@ pytest tests/
 | GET | `/api/v1/exports/{id}/manifest` | 查询导出 manifest |
 | GET | `/api/v1/exports/{id}/pages?cursor=` | NDJSON 分页续传（响应头返回下一个游标） |
 | POST | `/api/v1/exports/{id}/verify` | 提交导出内容 SHA-256 校验完整性 |
+| POST | `/api/v1/calibrations` | 创建设备指标校准配置（线性 offset/scale + 有效期，区间不得重叠） |
+| GET | `/api/v1/devices/{id}/calibrations/resolve?metric=&at=&value=` | 按时刻解析唯一生效校准并计算校准值（无配置返回 null） |
 
 ## 窗口聚合（Rollup）
 
@@ -206,6 +216,84 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/alerts/events?metric=temperature
 #        "event_type":"triggered","value":33.0,"event_time":"2026-09-22T08:00:04Z","created_at":"..."},
 #       {"id":8,"rule_id":1,"device_id":"ph-meter-01","metric":"temperature","seq":8,
 #        "event_type":"recovered","value":27.0,"event_time":"2026-09-22T08:00:08Z","created_at":"..."}]}
+```
+
+## 设备指标校准（Calibrations）
+
+按 **设备 + 指标** 维护若干段带有效期的**线性**校准配置：
+
+```
+calibrated = raw * scale + offset
+```
+
+- 有效期为**半开区间** `[valid_from, valid_to)`：`valid_from` 含、`valid_to` 不含；
+  `valid_to` 省略或为 `null` 表示**长期有效**（开放终点）；
+- 时间均为 ISO 8601，不带时区按 UTC 处理，服务端统一归一化为 UTC 存储与比较；
+- 同一 (设备, 指标) 的有效期**不得重叠**（端点相接允许，前段 `valid_to` 等于后段
+  `valid_from` 合法），不同设备 / 不同指标互不影响；
+- 重叠校验与写入在**同一数据库事务**内完成（并配合进程级串行锁），并发创建也不会产生重叠配置；
+- **校准只在解析请求时实时计算，绝不改写已存原始测量**：已提交包、缓冲、导出快照中的值始终是仪器原值。
+
+### 创建校准配置
+
+`POST /api/v1/calibrations` → `201 Created`
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `device_id` / `metric` | 是 | 设备号与指标名 |
+| `valid_from` | 是 | 生效起点（含），ISO 8601 |
+| `valid_to` | 否 | 生效终点（不含）；`null` 或缺省表示长期有效，且必须晚于 `valid_from` |
+| `offset` | 否 | 线性偏移量，默认 `0.0` |
+| `scale` | 否 | 线性比例，默认 `1.0`，不可为 `0` |
+
+错误：区间倒序 / 零长度、`scale=0` → `422`；与既有配置有效期重叠 → `409`（`detail` 给出冲突配置 id）。
+
+```bash
+# 2026 全年：温度读数整体放大 2 倍再加 1
+curl -X POST localhost:8000/api/v1/calibrations -H 'Content-Type: application/json' -d '{
+  "device_id": "ph-meter-01",
+  "metric": "temperature",
+  "valid_from": "2026-01-01T00:00:00Z",
+  "valid_to": "2027-01-01T00:00:00Z",
+  "offset": 1.0,
+  "scale": 2.0
+}'
+# => 201 {"id":1,"device_id":"ph-meter-01","metric":"temperature",
+#        "valid_from":"2026-01-01T00:00:00Z","valid_to":"2027-01-01T00:00:00Z",
+#        "offset":1.0,"scale":2.0,"created_at":"..."}
+
+# 端点相接（2027-01-01T00:00:00Z 起换用新配置）允许：
+curl -X POST localhost:8000/api/v1/calibrations -H 'Content-Type: application/json' -d '{
+  "device_id": "ph-meter-01", "metric": "temperature",
+  "valid_from": "2027-01-01T00:00:00Z", "valid_to": null,
+  "offset": 0.5, "scale": 1.0
+}'
+# 时间相交（如 2026-06-01 ~ 2027-06-01）=> 409
+```
+
+### 按时刻解析并计算校准值
+
+`GET /api/v1/devices/{device_id}/calibrations/resolve`
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `metric` | 是 | 指标名 |
+| `at` | 是 | 解析时刻，ISO 8601（不带时区按 UTC）；命中条件 `valid_from <= at < valid_to` |
+| `value` | 是 | 待校准的原始测量值（只读，服务端不做任何持久化） |
+
+因同 (设备, 指标) 区间互不重叠，命中结果**至多一条**：命中时返回该配置与
+`value*scale+offset`；设备未知、指标无配置或时刻不在任何有效期内时，
+`calibration` 与 `calibrated_value` **均为 `null`**（HTTP 仍为 200，不是 404）。
+
+```bash
+curl 'localhost:8000/api/v1/devices/ph-meter-01/calibrations/resolve?metric=temperature&at=2026-06-01T00:00:00Z&value=10'
+# => 200 {"device_id":"ph-meter-01","metric":"temperature",
+#        "at":"2026-06-01T00:00:00Z","value":10.0,
+#        "calibrated_value":21.0,
+#        "calibration":{"id":1,"offset":1.0,"scale":2.0, ...}}
+
+curl 'localhost:8000/api/v1/devices/ph-meter-01/calibrations/resolve?metric=temperature&at=2025-01-01T00:00:00Z&value=10'
+# => 200 {"value":10.0,"calibrated_value":null,"calibration":null, ...}
 ```
 
 ## 只读归档导出（Exports）
@@ -325,19 +413,21 @@ curl localhost:8000/api/v1/devices/ph-meter-01/duplicates   # 重复包记录
 
 ```
 app/
-  main.py     # FastAPI 路由
-  logic.py    # 摄入核心：幂等判定、缓冲、排水提交（提交时驱动告警评估）
-  alerts.py   # 阈值告警：规则 CRUD、带连续计数的迟滞状态机、按提交顺序评估
-  rollup.py   # 窗口聚合：半开窗口分桶、水位迟到判定
-  exports.py  # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验
-  db.py       # SQLite 连接与建表（启动时自动执行）
-  schemas.py  # Pydantic 模型
+  main.py          # FastAPI 路由
+  logic.py         # 摄入核心：幂等判定、缓冲、排水提交（提交时驱动告警评估）
+  alerts.py        # 阈值告警：规则 CRUD、带连续计数的迟滞状态机、按提交顺序评估
+  calibrations.py  # 设备指标校准：线性 offset/scale、有效期不重叠校验、按时刻解析
+  rollup.py        # 窗口聚合：半开窗口分桶、水位迟到判定
+  exports.py       # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验
+  db.py            # SQLite 连接与建表（启动时自动执行）
+  schemas.py       # Pydantic 模型
 tests/
-  conftest.py     # 测试数据库隔离（临时文件）
-  test_api.py     # 摄入 / 查询接口测试
-  test_rollup.py  # 窗口聚合测试
-  test_alerts.py  # 阈值告警测试
-  test_exports.py # 归档导出 / 游标 / 摘要校验测试
+  conftest.py        # 测试数据库隔离（临时文件）
+  test_api.py        # 摄入 / 查询接口测试
+  test_rollup.py     # 窗口聚合测试
+  test_alerts.py     # 阈值告警测试
+  test_calibrations.py # 校准配置 / 区间重叠 / 按时刻解析测试
+  test_exports.py    # 归档导出 / 游标 / 摘要校验测试
 Dockerfile / docker-entrypoint.sh / docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```

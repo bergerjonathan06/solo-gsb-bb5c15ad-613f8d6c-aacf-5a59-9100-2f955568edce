@@ -1,10 +1,12 @@
 services:
   api:
     build: .
+    # 宿主机:容器 端口映射；单命令 `docker compose up --build` 后访问 http://localhost:8000
     ports:
       - "8000:8000"
     environment:
       DB_PATH: /data/lab.db
+      PORT: "8000"
     volumes:
       - lab-data:/data
     restart: unless-stopped
